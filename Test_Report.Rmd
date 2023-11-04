@@ -1,0 +1,581 @@
+---
+title: "Merge Vikings Analysis Report"
+author: "Hung Nguyen"
+date: "`r Sys.Date()`"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+urlcolor: blue
+---
+
+```{r, echo=FALSE}
+# Set global chunk options
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE, fig.align='center')
+```
+
+```{r}
+# Load data from Snowflake
+library(DBI)
+library(odbc)
+
+# Manipulate data
+library(dplyr)
+library(sqldf)
+
+# Visualize data
+library(ggplot2)
+library(cowplot)
+```
+
+
+```{r}
+# Create snowflake connection
+conn <- dbConnect(odbc(),
+                  Driver="SnowflakeDSIIDriver",
+                  Server="bh01806.eu-west-1.snowflakecomputing.com",
+                  UID="candidate06",
+                  PWD="BDym5Cb520e1UNFVwsUv",
+                  Database="ANALYTICS_TEST",
+                  SCHEMA="TRAINEE_TASK")
+```
+
+```{r}
+# Connect to tables
+dim_player <- dbGetQuery(conn, "SELECT * FROM DIM_PLAYER")
+fct_virtual_currency_gain <- dbGetQuery(conn, "SELECT * FROM FCT_VIRTUAL_CURRENCY_GAIN")
+```
+
+# Problem definition
+
+Merge Vikings is a free-to-play merge-two mobile game developed by Metacore. The game has two main meta layers: in the first layer, the player can merge items to gain more resources to upgrade their troops and buildings, while the second layer is the strategic base management, defense and attack. The game has gained over 100K+ downloads on Google Play. 
+
+Before getting into the analysis, we must clearly define the business question: to find out what has happened to the performance of Merge Vikings. Given the data provided, the possible source of problem for lower game performance to analyze can be lack of player acquisition, low player retention, or other in-game issues. Therefore, we would like to investigate the following aspects:
+
+- Player acquisition: Analyze and find out if there is any issue with the player acquisition process from different marketing sources. This may reflect the performance of the marketing campaign from different sources to understand how efficient are the game marketing drawing the attention of first-time players. 
+- Player retention: Gain insights on player activity and how effective Merge Vikings is retaining their users. By investigating this aspect, we can identify the potential issue if the retention falls dramatically at some stage.
+- Player's game perspective: Analyze to understand the gaming experiences of user. If retention is falling, if marketing is doing well, the cause is likely to come from the game itself. By investigating the game design, we are able to understand which part of the gameplay caused the overall performance of the game itself to decrease.
+
+By examining the overview image and analyzing specific player segments in detail, we can identify any issues with the game.
+
+# Analysis
+
+## Player acquisition
+
+We can begin by looking into the player acquisition channels of the to largest player bases of Merge Vikings to identify the most important user flow sources. Below is a chart displaying the top 5 countries with largest market of players. 
+
+```{r}
+# Query the top 5 countries with the largest player base, grouped by media source.
+df_playerbase <- sqldf("
+      SELECT 
+        COUNT(DISTINCT PLAYER_KEY) AS 'player_count',
+        MEDIA_SOURCE,
+        COUNTRY_CODE,
+        total_player
+      FROM 
+        dim_player 
+      LEFT JOIN (
+        SELECT 
+          COUNT(DISTINCT PLAYER_KEY) AS 'total_player',
+          COUNTRY_CODE AS COUNTRY_CODE1
+        FROM 
+          dim_player
+        WHERE
+          COUNTRY_CODE IS NOT NULL
+        GROUP BY COUNTRY_CODE
+      ) AS 'total_count'
+      ON COUNTRY_CODE = COUNTRY_CODE1
+      WHERE 
+        MEDIA_SOURCE IS NOT NULL AND
+        COUNTRY_CODE IS NOT NULL AND
+        total_player >= 10000
+      GROUP BY MEDIA_SOURCE, COUNTRY_CODE
+      ORDER BY total_player DESC, player_count DESC, COUNTRY_CODE, MEDIA_SOURCE
+      ")
+```
+
+```{r, fig.width=9, fig.height=6, out.width='80%'}
+# Plot the top 5 countries with the largest player base, grouped by media source.
+ggplot(df_playerbase, aes(x=reorder(COUNTRY_CODE, total_player), y=player_count, fill=MEDIA_SOURCE)) +
+  labs(x="Country", y="Number of players", title="Countries with largest player base", fill="Channel") +
+  geom_bar(stat='identity') +
+  scale_y_continuous(expand=c(0,0), n.breaks=8) +
+  scale_fill_brewer(palette="YlGnBu", direction=-1) +
+  theme(plot.title = element_text(hjust = 0.5, face="bold"), 
+        legend.position = "top",
+        panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_line(linewidth=.1, color="lightgrey"),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) +
+  geom_hline(yintercept = 0) 
+```
+
+It is worth to note that AU, NL, CA, PH and GB are the only countries with a total player base of over 10000 people, while the sixth largest country only has around 6000 people, distinguishing themselves from the rest as the most important markets to consider. 
+
+From the plot, Facebook Ads is the marketing channel that attract the most players, responsible for generating around half of the player base for all of the five countries. Meanwhile, organic source, in the second place, has contributed the second highest number of new players to all five markets but PH. The relatively large inflow of organic players is a good indicator that the game has some virality and has been able to generate many new players actually interested and potentially more engaged into Merge Vikings, which is valuable to the game. Nonetheless, the player inflow of the game heavily depends on the performance of Facebook Ad marketing, which seems to have received very large investments, and this can potentially create issues. This is because putting too large investment or sole focus on only Facebook Ads but not organic source can backfires from attracting new players that are potentially just come for curiosity rather than genuine interests.
+
+Let us now view the performance of the marketing channel on a time series to better assess its effect on the overall player acquisition process of the game. The graph below displays the monthly player acquisition as a whole and for each marketing source. 
+
+```{r}
+# Create month columns from date columns.
+dim_player$COHORT_MONTH <- format(as.Date(dim_player$COHORT_DATE, "%Y-%m-%d"), "%Y-%m")
+dim_player$COHORT_DATE <- format(as.Date(dim_player$COHORT_DATE, "%Y-%m-%d"), "%Y-%m-%d")
+
+# Reformat the date columns into string type.
+fct_virtual_currency_gain$ACTIVITY_MONTH <- format(as.Date(fct_virtual_currency_gain$ACTIVITY_DATE, "%Y-%m-%d"), "%Y-%m")
+fct_virtual_currency_gain$ACTIVITY_DATE <- format(as.Date(fct_virtual_currency_gain$ACTIVITY_DATE, "%Y-%m-%d"), "%Y-%m-%d")
+```
+
+```{r}
+# Query time-series player acquisition data, grouped by marketing channel and month.
+# Note: The month May 2023 is omit because it is not completed.
+df_player_acq <- sqldf("
+      SELECT 
+        (CASE WHEN total_player IS NULL THEN 0 ELSE total_player END) AS 'total_player',
+        dp1.COHORT_MONTH,
+        dp1.MEDIA_SOURCE
+      FROM 
+        (SELECT 
+          COHORT_MONTH,   
+          COUNT(DISTINCT PLAYER_KEY) as 'total_player',
+          MEDIA_SOURCE
+        FROM dim_player 
+        WHERE 
+          COHORT_MONTH IS NOT NULL AND
+          MEDIA_SOURCE IS NOT NULL AND 
+          COHORT_MONTH <> '2023-05'
+        GROUP BY COHORT_MONTH, MEDIA_SOURCE
+        ORDER BY COHORT_MONTH) AS 'dp2'
+      RIGHT JOIN (
+        SELECT 
+          COHORT_MONTH, 
+          MEDIA_SOURCE 
+        FROM (SELECT DISTINCT COHORT_MONTH FROM dim_player) 
+        CROSS JOIN (SELECT DISTINCT MEDIA_SOURCE FROM dim_player) 
+        WHERE COHORT_MONTH IS NOT NULL AND 
+        MEDIA_SOURCE IS NOT NULL 
+        AND COHORT_MONTH <> '2023-05') AS 'dp1' 
+      ON (dp1.COHORT_MONTH = dp2.COHORT_MONTH AND dp1.MEDIA_SOURCE = dp2.MEDIA_SOURCE)
+      GROUP BY dp1.COHORT_MONTH, dp1.MEDIA_SOURCE
+      ORDER BY dp1.COHORT_MONTH
+      ")
+```
+
+```{r, fig.width=9, fig.height=8}
+# Plot total monthly player acquisition.
+p1 <- ggplot(df_player_acq, aes(x=COHORT_MONTH, y=total_player)) +
+  labs(x="Month", y="Number of players", title="Total monthly player acquisition", color="Channel") +
+  geom_bar(stat='identity', fill="deepskyblue3") +
+  scale_x_discrete(breaks = function(x){x[c(TRUE, FALSE)]}) +
+  scale_y_continuous(n.breaks=6) +
+  theme(plot.title = element_text(hjust = 0.5, size=17, face="bold"), 
+        legend.position = "top", 
+        axis.title.x = element_text(size=13), 
+        axis.title.y = element_text(size=13), 
+        panel.grid.major.x = element_blank(), 
+        panel.grid.major.y = element_line(linewidth=.05, color="lightgrey"), 
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) 
+
+# Plot total monthly player acquisition by channel.
+p2 <- ggplot(df_player_acq, aes(x=COHORT_MONTH, y=total_player, group=MEDIA_SOURCE, color=MEDIA_SOURCE)) +
+  labs(x="Month", y="Number of players", title="Monthly player acquisition by channel", color="Channel") +
+  geom_line(linewidth=1) +
+  geom_point() +
+  scale_x_discrete(breaks = function(x){x[c(TRUE, FALSE)]}) +
+  scale_y_continuous(n.breaks=6) +
+  theme(plot.title = element_text(hjust = 0.5, size=17, face="bold"), 
+        legend.position = "top",
+        axis.title.x = element_text(size=13), 
+        axis.title.y = element_text(size=13), 
+        panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_line(linewidth=.05, color="lightgrey"),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) 
+
+# Draw the plots on a grid.
+ggdraw() + 
+  draw_plot(p2, x=0, y=0, width=1, height=0.5) +
+  draw_plot(p1, x=0, y=0.5, width=1, height=0.5)
+```
+
+From the chart, we can see the very clear pattern of how the game has growth for each year of the period 2021-2023. At the beginning of 2021, player acquisition is modest. From around October 2021 to August 2022, the growth of player base is higher and remain quite stable. From October 2022 until now (May 2023), the game marketing has reached a significant peak of more than 12500 players and generally performs better in terms of player attraction. Nonetheless, just recently from January of 2023 until now, player acquisition has seems to slow down notably. 
+
+As expected, we can see that most of the player acquisition fluctuations are driven by Facebook Ads campaign: it is Facebook Ads that created the sudden incredible growth in 2022-12, and it is also Facebook Ads that led to the sudden downfall of total new players in 2023-01. With the sudden virality in 2022-12 of Merge Vikings, where we can clearly see that the organic player flow is starting to gain some great rising action, the company perhaps has failed to react to this opportunity well. Possibly, the company has put too much focus on Facebook Ads due to the large flow of user this campaign brings about and failed to pay attention on improving organic marketing (creating better brand image, create a game community, etc.) and soon cannot maintain the virality, thus leading to the great lost of player acquisition recently. It is important that when the game is starting to become popular from successful marketing campaign that the company focuses on having building a more solid brand awareness to maintain the position on the market. 
+
+## Player retention
+
+### First time user experience
+
+Previously, we mentioned that there might be an issue with the new players gained from Facebook Ads that they only come for curiosity and likely to churn. Let us now see whether the acquired players from each marketing campaign actually played the game after their first install. This can give us a quick check to understand how players acquired from different sources churn after their first time user experience (FTUE).
+
+```{r}
+# Query the retention rate after FTUE.
+df_start_game_rate <- sqldf("
+      SELECT
+        dp1.MEDIA_SOURCE,
+        COUNT(DISTINCT dim_player.PLAYER_KEY) * 1.0 / total_players AS 'players'
+      FROM
+        fct_virtual_currency_gain,
+        dim_player 
+      LEFT JOIN (
+        SELECT 
+          MEDIA_SOURCE,
+          COUNT(DISTINCT PLAYER_KEY) AS 'total_players'
+        FROM dim_player
+        WHERE MEDIA_SOURCE IS NOT NULL
+        GROUP BY MEDIA_SOURCE
+      ) AS 'dp1' 
+      ON dp1.MEDIA_SOURCE = dim_player.MEDIA_SOURCE
+      WHERE 
+        dim_player.PLAYER_KEY = fct_virtual_currency_gain.PLAYER_KEY AND
+        dp1.MEDIA_SOURCE IS NOT NULL AND 
+        CAST((JulianDay(ACTIVITY_DATE) - JulianDay(COHORT_DATE))
+          AS INTEGER ) > 1
+      GROUP BY dp1.MEDIA_SOURCE
+      ")
+
+# Query the number of players retained after FTUE.
+df_start_game_count <- sqldf("
+      SELECT
+        MEDIA_SOURCE,
+        COUNT(DISTINCT dim_player.PLAYER_KEY) 'total_players'
+      FROM
+        fct_virtual_currency_gain,
+        dim_player 
+      WHERE 
+        dim_player.PLAYER_KEY = fct_virtual_currency_gain.PLAYER_KEY AND
+        MEDIA_SOURCE IS NOT NULL AND 
+        CAST((JulianDay(ACTIVITY_DATE) - JulianDay(COHORT_DATE))
+          AS INTEGER ) > 1
+      GROUP BY MEDIA_SOURCE
+      ")
+```
+
+```{r, fig.width=14, fig.height=6}
+# Plot total number of players that keep playing after FTUE.
+p1 <- ggplot(df_start_game_count, aes(x=MEDIA_SOURCE, y=total_players, fill=MEDIA_SOURCE, group=MEDIA_SOURCE)) +
+  labs(x="Channel", y="Number of players", title="Total number of players that keep playing after FTUE") +
+  geom_bar(stat='identity') +
+  scale_y_continuous(expand=c(0,0), n.breaks=7) +
+  theme(plot.title = element_text(hjust = 0.5, size=17, face="bold"), 
+        legend.position = "none",
+        axis.title.x = element_text(size=13), 
+        axis.title.y = element_text(size=13), 
+        panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_line(linewidth=.05, color="lightgrey"),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) 
+
+# Plot percentage of players that keep playing after FTUE.
+p2 <- ggplot(df_start_game_rate, aes(x=MEDIA_SOURCE, y=players, fill=MEDIA_SOURCE, group=MEDIA_SOURCE)) +
+  labs(x="Channel", y="Percent of total acquired players", title="Percentage of players that keep playing after FTUE") +
+  geom_bar(stat='identity') +
+  scale_y_continuous(expand=c(0,0), n.breaks=6) +
+  theme(plot.title = element_text(hjust = 0.5, size=17, face="bold"), 
+        legend.position = "none",
+        axis.title.x = element_text(size=13), 
+        axis.title.y = element_text(size=13), 
+        panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_line(linewidth=.05, color="lightgrey"),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) 
+
+# Draw the plots on a grid.
+ggdraw() + 
+  draw_plot(p1, x=0, y=0, width=0.5, height=1) +
+  draw_plot(p2, x=0.5, y=0, width=0.5, height=1)
+```
+Facebook Ads again contribute the highest first-time players of around 8000, while it is 5500 for the case of organic. We can observe that Facebook Ads and organic source dominate other channels in terms of engaging first-time players to a second time of playing, as expected from their large player acquisition. Because of this, let us only focus on the two highest channel, as the other channels is likely to be insignificant. 
+
+Back to the question we set out to answer: whether the acquired players from each marketing campaign actually played the game after their first install. It is clear to see that when putting to the context of total player acquired as a whole, the rate of conversion from first-time player to second time player is now quite low at 10% for Facebook Ads. This is the case same to organic players, where it is relatively higher but still considered to be low at around 17%. Given this information, we are able to confirm that the conversion rate from first-time players to second-time players is higher for organic sources compared to Facebook Ads. While Facebook Ads contribute the highest number of first-time players, the majority of them do not continue playing after their first trial. On the other hand, organic sources have a higher percentage of players who continue playing after their first trial. This suggests that while Facebook Ads are effective in attracting a large number of first-time players, organic sources may be more slightly effective in retaining players. 
+
+Nonetheless, we cannot ignore the fact that the overall FTUE retention is relatively low, remaining at lower than 17% for all channel but vungle_int. The reason for this issue can again be partially addressed by the fact the game does not have a solid brand awareness, thus resulting in players churning because they do not feel like they belong the game, or they do not feel like the game is engaging enough to keep playing. In addition, low FTUE retention can also be addressed by another possible issue: there might be some problem with the game itself. We will further expand this analysis by moving to the retention of players within the game itself. 
+
+### Player in-game retention 
+
+Let us now look at a bigger picture of player retention to learn more about the retention rate of an average Merge Vikings player over a defined period. From this, we can understand at what stage that the problem of low player retention starts to occur and later analyze using in-game information. 
+
+The plot below shows the rolling retention rate of an average user, that is how many users have had some activity on Merge Vikings at least once N days past the date of installation. In this case, it is tracked for a period of 180 days and the snapshot D1, D7, D20, D30, D60, D90, D150 and D180, which are the common checkpoint of churning, are captured.
+
+```{r}
+# Query the number of days from reg (rolling retention).
+df_days_from_reg <- sqldf("
+      SELECT
+        dim_player.PLAYER_KEY AS 'PLAYER_ID',
+        COHORT_DATE,
+        ACTIVITY_DATE,
+        CAST((JulianDay(ACTIVITY_DATE) - JulianDay(COHORT_DATE))
+          AS INTEGER ) AS 'days_from_reg'
+      FROM
+        fct_virtual_currency_gain,
+        dim_player
+      ON dim_player.PLAYER_KEY = fct_virtual_currency_gain.PLAYER_KEY
+      ")
+
+# Query total number of players ever in the game. 
+df_reg <- sqldf("
+      SELECT COUNT(DISTINCT PLAYER_KEY) AS 'total_players'
+      FROM dim_player
+      ")
+```
+
+```{r}
+# Compute rolling retention for each 1, 2,..., 180 day from install.
+day <- seq(1, 180)
+retention <- c()
+
+for(i in day) {
+  # Compute retained players at day >= i.
+  retained_players <- n_distinct(filter(df_days_from_reg, days_from_reg >= i)$PLAYER_ID)
+  # Total number of players in the game.
+  total_players <- df_reg[1, "total_players"]
+  # Compute retention rate.
+  retention_rate <- retained_players / total_players
+  # Add retention rate to gatherer vector.
+  retention <- c(retention, retention_rate)
+}
+
+df_retention <- data.frame(day=day, retention=retention)
+```
+
+
+```{r, out.width='80%'}
+# Plot 180-day rolling retention.
+ggplot(df_retention, aes(x=day, y=retention)) +
+  labs(title="180-day period retention", x="Days after install", y="Retention rate") +
+  geom_line(color="deepskyblue4", linewidth=1) +
+  scale_x_continuous(breaks=c(1, 7, 20, 30, 60, 90, 150, 180)) +
+  scale_y_continuous(n.breaks=8, limits=c(NA, 0.14)) +
+  theme(plot.title = element_text(hjust = 0.5, face="bold"), 
+        legend.position = "top",
+        axis.title.x = element_text(size=13), 
+        axis.title.y = element_text(size=13), 
+        panel.grid.major.y = element_line(linewidth=.1, color="lightgrey"),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) 
+```
+
+Only after FTUE, the percentage of retained players has already remained low at 13%. For the next 20 days in game, the retention of players exhibits a highly steep slope and drops significantly from 13% to only around 7%. The curve then slightly flattens after day 20 then becomes flat at day 150, where there is only 1-2% of players remain. The low retention rate at day 1 is a concrete indicator that player quickly lose interest in Merge Vikings only after the first play. A possible explanation can be that the FTUE is not well-designed (game instructions unclear, FTUE is not attractive enough). Moreover, with the first week into the game witnesses a significant drop of players and with this trend maintains until day 20, it signals that there is some serious issue with new players engagement strategies within Merge Vikings gameplay. To find out the reason for such early churn of new players, we have to further investigate in-game experiences from the player's perspective. 
+
+## Player's game perspective
+
+To understand the how the game goes from a player's viewpoint, we can look into the townhall level progression. The townhall level is an accurate indicator of what level is the player at, and how much progress he/she has put into playing Merge Vikings. By examining this, we should be able to understand the in-game leveling up process and identify potential obstacle preventing players from climbing up the ladder. 
+```{r}
+# Query time to level up for each townhall level.
+df_levelup_time <- sqldf("
+      SELECT
+        TOWNHALL_LEVEL,
+        AVG(days_from_reg) AS 'days_from_reg'
+      FROM
+        (SELECT
+          TOWNHALL_LEVEL,
+          MAX(CAST((JulianDay(ACTIVITY_DATE) - JulianDay(COHORT_DATE))
+          AS INTEGER)) AS 'days_from_reg'
+        FROM
+          fct_virtual_currency_gain,
+          dim_player
+        WHERE 
+          fct_virtual_currency_gain.PLAYER_KEY = dim_player.PLAYER_KEY AND 
+          TOWNHALL_LEVEL IS NOT NULL
+        GROUP BY TOWNHALL_LEVEL, fct_virtual_currency_gain.PLAYER_KEY)
+      GROUP BY TOWNHALL_LEVEL
+      ORDER BY TOWNHALL_LEVEL
+      ")
+
+# Query number of players for each townhall level.
+df_level_division <- sqldf("
+      SELECT
+        TOWNHALL_LEVEL,
+        COUNT(*) AS player_count
+      FROM (SELECT 
+              PLAYER_KEY,
+              MAX(TOWNHALL_LEVEL) AS TOWNHALL_LEVEL
+          FROM fct_virtual_currency_gain
+          WHERE TOWNHALL_LEVEL IS NOT NULL
+          GROUP BY PLAYER_KEY)  
+      WHERE TOWNHALL_LEVEL IS NOT NULL
+      GROUP BY TOWNHALL_LEVEL
+      ORDER BY TOWNHALL_LEVEL
+      ")
+```
+
+
+```{r, fig.width=14, fig.height=6}
+# Plot average days spent on each townhall level.
+p1 <- ggplot(df_levelup_time, aes(x=TOWNHALL_LEVEL, y=days_from_reg)) +
+  labs(title="Average days spent on each townhall level", x="Townhall level", y="Days after install") +
+  geom_line(color="deepskyblue4", linewidth=1) +
+  geom_point(color="deepskyblue4") +
+  scale_x_continuous(breaks=seq(1,8)) +
+  scale_y_continuous(expand=c(0,0), limits=c(0,140), n.breaks=8) +
+  theme(plot.title = element_text(hjust = 0.5, face="bold"), 
+        legend.position = "top",
+        axis.title.x = element_text(size=13), 
+        axis.title.y = element_text(size=13), 
+        panel.grid.major.y = element_line(linewidth=.1, color="lightgrey"),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) 
+
+# Plot current number of players on each level of townhall.
+p2 <- ggplot(df_level_division, aes(x=TOWNHALL_LEVEL, y=player_count)) +
+  labs(title="Current number of players on each level of townhall", x="Townhall level", y="Number of players") +
+  geom_bar(stat='identity', fill="deepskyblue3") +
+  scale_x_continuous(breaks=seq(1,8)) +
+  scale_y_continuous(expand=c(0,0), n.breaks=8) +
+  theme(plot.title = element_text(hjust = 0.5, face="bold"), 
+        legend.position = "top",
+        axis.title.x = element_text(size=13), 
+        axis.title.y = element_text(size=13), 
+        panel.grid.major.y = element_line(linewidth=.1, color="lightgrey"),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) 
+
+# Draw the plots on a grid.
+ggdraw() + 
+  draw_plot(p1, x=0, y=0, width=0.5, height=1) +
+  draw_plot(p2, x=0.5, y=0, width=0.5, height=1)
+```
+We can observe that while an average player spends around 8 days at townhall 1, it takes them up to 20 days to complete townhall 2, which coincides to the same period that players start to churn the highest in the previous analysis. In addition, the division of players on townhall level 1 and 2 are significantly higher than others, with townhall 2 having the highest base of more than 9000 players. This indicates that players tend to be stuck at the first two levels of townhall, especially at townhall 2. Although it is indeed reasonable that the number of lower townhall players should be higher, given that Merge vikings gameplay is casual and the number of harder-core players should logically be lower, the time spent on the first levels should not be too long, since players, even casual players, can quickly lose interests to the game if they do not see any visible progress or changes to encourage them playing and churn. 
+
+To find out the obstacle that have caused troubles to players at the early stage of the game, let us investigate the currencies they are gaining at each level. This can give us insights on whether the resources given to them is large enough to help them progress quickly through the townhall levels. 
+```{r}
+# Compute average balance for each townhall level.
+df_balance <- sqldf("
+      SELECT
+        TOWNHALL_LEVEL,
+        AVG(SHEEP_BALANCE) AS 'avg_sheep_bal',
+        AVG(GOLD_BALANCE) AS 'avg_gold_bal',
+        AVG(GEM_BALANCE) AS 'avg_gem_bal',
+        AVG(TROPHY_BALANCE)  AS 'avg_trophy_bal'
+      FROM fct_virtual_currency_gain
+      WHERE TOWNHALL_LEVEL IS NOT NULL
+      GROUP BY TOWNHALL_LEVEL
+      ORDER BY TOWNHALL_LEVEL
+")
+```
+
+```{r, fig.width=12, fig.height=7}
+# Plot average sheep balance for each townhall level.
+p1 <- ggplot(df_balance, aes(x=TOWNHALL_LEVEL, y=avg_sheep_bal)) +
+  labs(title="Average sheep balance on each townhall level", x="Townhall level", y="Sheep balance") +
+  geom_line(color="bisque3", linewidth=1) +
+  geom_point(color="bisque3") +
+  scale_x_continuous(breaks=seq(1,8)) +
+  scale_y_continuous(expand=c(0,0), n.breaks=8) +
+  theme(plot.title = element_text(hjust = 0.5, face="bold"), 
+        legend.position = "top",
+        axis.title.x = element_text(size=13), 
+        axis.title.y = element_text(size=13), 
+        panel.grid.major.y = element_line(linewidth=.1, color="lightgrey"),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) 
+
+# Plot average gold balance for each townhall level.
+p2 <- ggplot(df_balance, aes(x=TOWNHALL_LEVEL, y=avg_gold_bal)) +
+  labs(title="Average gold balance on each townhall level", x="Townhall level", y="Gold balance") +
+  geom_line(color="darkgoldenrod2", linewidth=1) +
+  geom_point(color="darkgoldenrod2") +
+  scale_x_continuous(breaks=seq(1,8)) +
+  scale_y_continuous(expand=c(0,0), n.breaks=8) +
+  theme(plot.title = element_text(hjust = 0.5, face="bold"), 
+        legend.position = "top",
+        axis.title.x = element_text(size=13), 
+        axis.title.y = element_text(size=13), 
+        panel.grid.major.y = element_line(linewidth=.1, color="lightgrey"),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) 
+
+# Plot average gem balance for each townhall level.
+p3 <- ggplot(df_balance, aes(x=TOWNHALL_LEVEL, y=avg_gem_bal)) +
+  labs(title="Average gem balance on each townhall level", x="Townhall level", y="Gem balance") +
+  geom_line(color="chartreuse3", linewidth=1) +
+  geom_point(color="chartreuse3") +
+  scale_x_continuous(breaks=seq(1,8)) +
+  scale_y_continuous(expand=c(0,0), n.breaks=8) +
+  theme(plot.title = element_text(hjust = 0.5, face="bold"), 
+        legend.position = "top",
+        axis.title.x = element_text(size=13), 
+        axis.title.y = element_text(size=13), 
+        panel.grid.major.y = element_line(linewidth=.1, color="lightgrey"),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) 
+
+# Plot average trophy balance for each townhall level.
+p4 <- ggplot(df_balance, aes(x=TOWNHALL_LEVEL, y=avg_trophy_bal)) +
+  labs(title="Average trophy balance on each townhall level", x="Townhall level", y="Trophy balance") +
+  geom_line(color="deepskyblue4", linewidth=1) +
+  geom_point(color="deepskyblue4") +
+  scale_x_continuous(breaks=seq(1,8)) +
+  scale_y_continuous(expand=c(0,0), n.breaks=8) +
+  theme(plot.title = element_text(hjust = 0.5, face="bold"), 
+        legend.position = "top",
+        axis.title.x = element_text(size=13), 
+        axis.title.y = element_text(size=13), 
+        panel.grid.major.y = element_line(linewidth=.1, color="lightgrey"),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) 
+
+# Draw the plots on a grid.
+ggdraw() + 
+  draw_plot(p1, x=0, y=0, width=0.5, height=0.5) +
+  draw_plot(p2, x=0.5, y=0, width=0.5, height=0.5) +
+  draw_plot(p3, x=0, y=0.5, width=0.5, height=0.5) +
+  draw_plot(p4, x=0.5, y=0.5, width=0.5, height=0.5)
+```
+From the charts, we can see that the average balance of gold, sheep and trophy is relatively low at the first levels. Moreover, these types of resources progress quite slowly throughout the levels and only start to grow noticeably at townhall 6. With not enough gold, sheep, players cannot buy items to merge, or to upgrade their troops/buildings, players can only progress very slowly, upgrading little at a time then was kept on a long cooldown time. Low trophy balance is also an indicator that lower-level players are not mainly interested in participating raids/combats on other player's island, possibly because the loot from it is not encouraging enough. On the other hand, gems, a premium resource allowing players to perform many actions that help them progress faster through the game (buy more sheep, gold, skip waiting time, etc.), is quickly spent only on the first two levels of townhall. This behavior is expected, given we have just found out that players are kept on a long time to complete townhall 2 so they can grow impatient and spend gems to skip the wait. 
+
+The reason for the long completion time of the very first levels of the game is now clear: the loot players gaining are simply not enough to help them progress through the first levels of the game. Although most players of the game is casual players, it is more encouraging and more engaging for them to see visible progress and stay with the game longer. This is clearly shown by the gem balance curve, showing that new players quickly spent all the gems they have in order to skip through the waiting time or compensate for the lack of other resources. 
+
+In order to confirm this, we would like to look at the looting sources in Merge Vikings, which can help us to see how the players are mainly farming their resources, and it is high enough to actually help them see more visible progress through upgrading/merging.  
+
+```{r}
+# Query number of times and average amount gained from each source.
+df_bal_collect <- sqldf("
+      SELECT
+        SOURCE,
+        CURRENCY_GAINED,
+        AVG(AMOUNT_GAINED) AS avg_count,
+        COUNT(PLAYER_KEY) AS players
+      FROM fct_virtual_currency_gain
+      WHERE 
+        CURRENCY_GAINED IS NOT NULL 
+      GROUP BY SOURCE, CURRENCY_GAINED
+      ORDER BY CURRENCY_GAINED, players DESC, avg_count DESC, SOURCE
+")
+```
+
+
+```{r, fig.width=15, fig.height=8}
+# Plot popularity of each looting source.
+p1 <- ggplot(df_bal_collect, aes(x=SOURCE, y=players, group=CURRENCY_GAINED, fill=CURRENCY_GAINED)) +
+  labs(title="Popularity of each looting source", x="Source", y="Number of times") +
+  geom_bar(stat='identity', position='dodge') +
+  geom_text(aes(label=players, color=CURRENCY_GAINED), position=position_dodge(width=.9), vjust=-0.9, size=3) +
+  scale_x_discrete(guide = guide_axis(n.dodge=2)) +
+  scale_y_continuous(expand=c(0,0), n.breaks=8, limits=c(0, 3000000)) +
+  theme(plot.title = element_text(hjust = 0.5, face="bold"), 
+        legend.position = "top",
+        axis.title.x = element_text(size=13), 
+        axis.title.y = element_text(size=13), 
+        panel.grid.major.y = element_line(linewidth=.1, color="lightgrey"),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) 
+
+# Plot average amount gained for each action.
+p2 <- ggplot(df_bal_collect, aes(x=SOURCE, y=avg_count, group=CURRENCY_GAINED, fill=CURRENCY_GAINED)) +
+  labs(title="Average amount gained for each action", x="Source", y="Amount") +
+  geom_bar(stat='identity', position='dodge') +
+  geom_text(aes(label=round(avg_count,1), color=CURRENCY_GAINED), position=position_dodge(width=.9), vjust=-0.9, size=3) +
+  scale_x_discrete(guide = guide_axis(n.dodge=2)) +
+  scale_y_continuous(expand=c(0,0), n.breaks=8, limits=c(0, 50000)) +
+  theme(plot.title = element_text(hjust = 0.5, face="bold"), 
+        legend.position = "top",
+        axis.title.x = element_text(size=13), 
+        axis.title.y = element_text(size=13), 
+        panel.grid.major.y = element_line(linewidth=.1, color="lightgrey"),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) 
+
+# Draw the plots on a grid.
+ggdraw() + 
+  draw_plot(p2, x=0, y=0, width=1, height=0.5) +
+  draw_plot(p1, x=0, y=0.5, width=1, height=0.5)
+```
+
+As we can see, the two most popular sources to acquire gold/sheep are through collecting by quick tap and selling items. This is expected because it is a part of the main gameplay mechanics, where players can generate resources from the Stockyard to collect, or sell other items they don't need in the shop to exchange for resources. However, the amount they are gaining for each of these actions is the smallest, perhaps too small for them to make good progress. While purchasing through shops can gain players the highest sheep/gold, it requires the premium resource gems and there is no easy way to obtain gems without paying real money. This is possibly set up to suggests players to make in-app purchase in order to progress further so the game can gain revenue. However, with such an early game lack of resource, players' game asset is not large enough to incentivize them to invest real money into the game, leading to discouragement and churn. 
+
+# Conclusion
+
+In this report, we have analyzed the performance of Merge Vikings, a mobile game developed by Metacore. We have used various metrics to identify the main problems that affect the game’s acquisition, retention, and in-game experiences and form hypothesis for them:
+
+- The acquisition of players in the last 3 months has witnessed a noticeable fall after the sudden peak in December 2022. We hypothesize that the company has focused too much on Facebook Ads, which is the main marketing channel, but not organic marketing throughout building a better brand image, game community to improve game awareness and maintain the virality of the game longer.
+- A large number of user acquired from Facebook Ads, which is the main marketing channel, does not convert to second-time player who churn right after FTUE. We hypothesize that FTUE is not well-designed: game instruction is not clear/not engaging, organic marketing is not done well to connect to new players and engage them to keep playing.
+- Player retention drops significantly after the first 20 days into the game. We hypothesize that new players are kept too long to level up from townhall 2 and to see any visible progress, thus they tend to churn.
+- The game looting mechanics is too slow to help players to progress through the first levels of the game. We hypothesize that the game possibly has tried to create too many obstacles to encourage players to spend at an early stage into the game to improve monetization, but this has backfired by causing players to churn instead. 
+
